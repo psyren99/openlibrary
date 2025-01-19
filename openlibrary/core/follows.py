@@ -1,5 +1,6 @@
 import logging
 from typing import cast
+
 from openlibrary.core.bookshelves import Bookshelves
 from openlibrary.utils.dateutil import DATE_ONE_MONTH_AGO, DATE_ONE_WEEK_AGO
 
@@ -105,7 +106,7 @@ class PubSub:
 
         # Add keys
         for i, rb in enumerate(recent_books):
-            recent_books[i].key = f'/works/OL{recent_books[i].work_id}W'
+            recent_books[i].key = f'/works/OL{rb.work_id}W'
 
         return Bookshelves.fetch(recent_books)
 

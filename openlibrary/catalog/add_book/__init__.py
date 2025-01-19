@@ -24,23 +24,27 @@ A record is loaded by calling the load function.
 """
 
 import itertools
-import json
 import re
-from typing import TYPE_CHECKING, Any, Final
-
-import web
-
 from collections import defaultdict
 from copy import copy
 from time import sleep
+from typing import TYPE_CHECKING, Any, Final
 
 import requests
+import web
 
 from infogami import config
-
 from openlibrary import accounts
+from openlibrary.catalog.add_book.load_book import (
+    build_query,
+    east_in_by_statement,
+    import_author,
+)
+from openlibrary.catalog.add_book.match import editions_match, mk_norm
 from openlibrary.catalog.utils import (
     EARLIEST_PUBLISH_YEAR_FOR_BOOKSELLERS,
+    InvalidLanguage,
+    format_languages,
     get_non_isbn_asin,
     get_publication_year,
     is_independently_published,
@@ -50,18 +54,10 @@ from openlibrary.catalog.utils import (
     published_in_future_year,
 )
 from openlibrary.core import lending
-from openlibrary.plugins.upstream.utils import strip_accents, safeget
-from openlibrary.utils import uniq, dicthash
+from openlibrary.plugins.upstream.utils import safeget, strip_accents
+from openlibrary.utils import dicthash, uniq
 from openlibrary.utils.isbn import normalize_isbn
 from openlibrary.utils.lccn import normalize_lccn
-
-from openlibrary.catalog.add_book.load_book import (
-    build_query,
-    east_in_by_statement,
-    import_author,
-    InvalidLanguage,
-)
-from openlibrary.catalog.add_book.match import editions_match, mk_norm
 
 if TYPE_CHECKING:
     from openlibrary.plugins.upstream.models import Edition
@@ -69,7 +65,14 @@ if TYPE_CHECKING:
 re_normalize = re.compile('[^[:alphanum:] ]', re.U)
 re_lang = re.compile('^/languages/([a-z]{3})$')
 ISBD_UNIT_PUNCT = ' : '  # ISBD cataloging title-unit separator punctuation
-SUSPECT_PUBLICATION_DATES: Final = ["1900", "January 1, 1900", "1900-01-01"]
+SUSPECT_PUBLICATION_DATES: Final = [
+    "1900",
+    "January 1, 1900",
+    "1900-01-01",
+    "????",
+    "01-01-1900",
+]
+SUSPECT_AUTHOR_NAMES: Final = ["unknown", "n/a"]
 SOURCE_RECORDS_REQUIRING_DATE_SCRUTINY: Final = ["amazon", "bwb", "promise"]
 
 
@@ -468,13 +471,12 @@ def build_pool(rec):
     return {k: list(v) for k, v in pool.items() if v}
 
 
-def find_quick_match(rec):
+def find_quick_match(rec: dict) -> str | None:
     """
     Attempts to quickly find an existing item match using bibliographic keys.
 
     :param dict rec: Edition record
-    :rtype: str|bool
-    :return: First key matched of format "/books/OL..M" or False if no match found.
+    :return: First key matched of format "/books/OL..M" or None if no match found.
     """
 
     if 'openlibrary' in rec:
@@ -502,7 +504,7 @@ def find_quick_match(rec):
                 continue
             if ekeys := editions_matched(rec, f, rec[f][0]):
                 return ekeys[0]
-    return False
+    return None
 
 
 def editions_matched(rec, key, value=None):
@@ -525,60 +527,11 @@ def editions_matched(rec, key, value=None):
     return ekeys
 
 
-def find_exact_match(rec, edition_pool):
-    """
-    Returns an edition key match for rec from edition_pool
-    Only returns a key if all values match?
-
-    :param dict rec: Edition import record
-    :param dict edition_pool:
-    :rtype: str|bool
-    :return: edition key
-    """
-    seen = set()
-    for editions in edition_pool.values():
-        for ekey in editions:
-            if ekey in seen:
-                continue
-            seen.add(ekey)
-            existing = web.ctx.site.get(ekey)
-
-            match = True
-            for k, v in rec.items():
-                if k == 'source_records':
-                    continue
-                existing_value = existing.get(k)
-                if not existing_value:
-                    continue
-                if k == 'languages':
-                    existing_value = [
-                        str(re_lang.match(lang.key).group(1)) for lang in existing_value
-                    ]
-                if k == 'authors':
-                    existing_value = [dict(a) for a in existing_value]
-                    for a in existing_value:
-                        del a['type']
-                        del a['key']
-                    for a in v:
-                        if 'entity_type' in a:
-                            del a['entity_type']
-                        if 'db_name' in a:
-                            del a['db_name']
-
-                if existing_value != v:
-                    match = False
-                    break
-            if match:
-                return ekey
-    return False
-
-
-def find_enriched_match(rec, edition_pool):
+def find_threshold_match(rec: dict, edition_pool: dict) -> str | None:
     """
     Find the best match for rec in edition_pool and return its key.
     :param dict rec: the new edition we are trying to match.
     :param list edition_pool: list of possible edition key matches, output of build_pool(import record)
-    :rtype: str|None
     :return: None or the edition key '/books/OL...M' of the best edition match for enriched_rec in edition_pool
     """
     seen = set()
@@ -587,21 +540,16 @@ def find_enriched_match(rec, edition_pool):
             if edition_key in seen:
                 continue
             thing = None
-            found = True
             while not thing or is_redirect(thing):
                 seen.add(edition_key)
                 thing = web.ctx.site.get(edition_key)
                 if thing is None:
-                    found = False
                     break
                 if is_redirect(thing):
                     edition_key = thing['location']
-                    # FIXME: this updates edition_key, but leaves thing as redirect,
-                    # which will raise an exception in editions_match()
-            if not found:
-                continue
-            if editions_match(rec, thing):
+            if thing and editions_match(rec, thing):
                 return edition_key
+    return None
 
 
 def load_data(
@@ -679,9 +627,14 @@ def load_data(
 
     edits: list[dict] = []  # Things (Edition, Work, Authors) to be saved
     reply = {}
-    # TOFIX: edition.authors has already been processed by import_authors() in build_query(), following line is a NOP?
+    # edition.authors may have already been processed by import_authors() in build_query(),
+    # but not necessarily
     author_in = [
-        import_author(a, eastern=east_in_by_statement(rec, a))
+        (
+            import_author(a, eastern=east_in_by_statement(rec, a))
+            if isinstance(a, dict)
+            else a
+        )
         for a in edition.get('authors', [])
     ]
     # build_author_reply() adds authors to edits
@@ -790,15 +743,11 @@ def normalize_import_record(rec: dict) -> None:
     rec['authors'] = uniq(rec.get('authors', []), dicthash)
 
     # Validation by parse_data(), prior to calling load(), requires facially
-    # valid publishers, authors, and publish_date. If data are unavailable, we
-    # provide throw-away data which validates. We use ["????"] as an override,
-    # but this must be removed prior to import.
+    # valid publishers. If data are unavailable, we provide throw-away data
+    # which validates. We use ["????"] as an override, but this must be
+    # removed prior to import.
     if rec.get('publishers') == ["????"]:
         rec.pop('publishers')
-    if rec.get('authors') == [{"name": "????"}]:
-        rec.pop('authors')
-    if rec.get('publish_date') == "????":
-        rec.pop('publish_date')
 
     # Remove suspect publication dates from certain sources (e.g. 1900 from Amazon).
     if any(
@@ -835,16 +784,9 @@ def validate_record(rec: dict) -> None:
         raise SourceNeedsISBN
 
 
-def find_match(rec, edition_pool) -> str | None:
+def find_match(rec: dict, edition_pool: dict) -> str | None:
     """Use rec to try to find an existing edition key that matches."""
-    match = find_quick_match(rec)
-    if not match:
-        match = find_exact_match(rec, edition_pool)
-
-    if not match:
-        match = find_enriched_match(rec, edition_pool)
-
-    return match
+    return find_quick_match(rec) or find_threshold_match(rec, edition_pool)
 
 
 def update_edition_with_rec_data(
@@ -877,20 +819,30 @@ def update_edition_with_rec_data(
         'lc_classifications',
         'oclc_numbers',
         'source_records',
+        'languages',
     ]
-    for f in edition_list_fields:
-        if f not in rec or not rec[f]:
+    edition_dict: dict = edition.dict()
+    for field in edition_list_fields:
+        if field not in rec:
             continue
-        # ensure values is a list
-        values = rec[f] if isinstance(rec[f], list) else [rec[f]]
-        if f in edition:
-            # get values from rec field that are not currently on the edition
-            case_folded_values = {v.casefold() for v in edition[f]}
-            to_add = [v for v in values if v.casefold() not in case_folded_values]
-            edition[f] += to_add
+
+        existing_values = edition_dict.get(field, []) or []
+        rec_values = rec.get(field, [])
+
+        # Languages in `rec` are ['eng'], etc., but import requires dict-style.
+        if field == 'languages':
+            formatted_languages = format_languages(languages=rec_values)
+            supplemented_values = existing_values + [
+                lang for lang in formatted_languages if lang not in existing_values
+            ]
         else:
-            edition[f] = to_add = values
-        if to_add:
+            case_folded_values = [v.casefold() for v in existing_values]
+            supplemented_values = existing_values + [
+                v for v in rec_values if v.casefold() not in case_folded_values
+            ]
+
+        if existing_values != supplemented_values:
+            edition[field] = supplemented_values
             need_edition_save = True
 
     # Fields that are added as a whole if absent. (Individual values are not added.)
@@ -907,7 +859,7 @@ def update_edition_with_rec_data(
             edition[f] = rec[f]
             need_edition_save = True
 
-    # Add new identifiers
+    # Add new identifiers (dict values, so different treatment from lists above.)
     if 'identifiers' in rec:
         identifiers = defaultdict(list, edition.dict().get('identifiers', {}))
         for k, vals in rec['identifiers'].items():
@@ -982,33 +934,7 @@ def should_overwrite_promise_item(
     return bool(safeget(lambda: edition['source_records'][0], '').startswith("promise"))
 
 
-def supplement_rec_with_import_item_metadata(
-    rec: dict[str, Any], identifier: str
-) -> None:
-    """
-    Queries for a staged/pending row in `import_item` by identifier, and if found, uses
-    select metadata to supplement empty fields/'????' fields in `rec`.
-
-    Changes `rec` in place.
-    """
-    from openlibrary.core.imports import ImportItem  # Evade circular import.
-
-    import_fields = [
-        'authors',
-        'publish_date',
-        'publishers',
-        'number_of_pages',
-        'physical_format',
-    ]
-
-    if import_item := ImportItem.find_staged_or_pending([identifier]).first():
-        import_item_metadata = json.loads(import_item.get("data", '{}'))
-        for field in import_fields:
-            if not rec.get(field) and (staged_field := import_item_metadata.get(field)):
-                rec[field] = staged_field
-
-
-def load(rec: dict, account_key=None, from_marc_record: bool = False):
+def load(rec: dict, account_key=None, from_marc_record: bool = False) -> dict:
     """Given a record, tries to add/match that edition in the system.
 
     Record is a dictionary containing all the metadata of the edition.
@@ -1026,10 +952,6 @@ def load(rec: dict, account_key=None, from_marc_record: bool = False):
         validate_record(rec)
 
     normalize_import_record(rec)
-
-    # For recs with a non-ISBN ASIN, supplement the record with BookWorm metadata.
-    if non_isbn_asin := get_non_isbn_asin(rec):
-        supplement_rec_with_import_item_metadata(rec=rec, identifier=non_isbn_asin)
 
     # Resolve an edition if possible, or create and return one if not.
     edition_pool = build_pool(rec)

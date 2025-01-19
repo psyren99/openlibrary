@@ -32,6 +32,8 @@ usage:
 }
 """
 
+import lxml.etree
+
 from openlibrary.plugins.importapi.import_edition_builder import import_edition_builder
 
 
@@ -89,12 +91,13 @@ def metaxml_to_edition_dict(root):
 
 
 if __name__ == '__main__':
-    from lxml import etree
     import sys
+
+    from lxml import etree
 
     assert len(sys.argv) == 2
 
-    tree = etree.parse(sys.argv[1])
+    tree = etree.parse(sys.argv[1], parser=lxml.etree.XMLParser(resolve_entities=False))
     root = tree.getroot()
 
     edition_dict = metaxml_to_edition_dict(root)
